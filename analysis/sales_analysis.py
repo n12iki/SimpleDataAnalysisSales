@@ -3,19 +3,45 @@ import pandas as pd
 
 
 # ---------------------------------------------------------
-# 1. Data Preparation & Merging (with dd-mm-yyyy date parsing)
+# Helper: Warning-Free Date Parser (dd-mm-yyyy & ISO safe)
+# ---------------------------------------------------------
+def _safe_parse_date_series(series: pd.Series) -> pd.Series:
+    """Parses a Series of dates supporting dd-mm-yyyy and yyyy-mm-dd without warnings."""
+    if pd.api.types.is_datetime64_any_dtype(series):
+        return series
+
+    s = series.astype(str).str.strip()
+    res = pd.to_datetime(s, format="%d-%m-%Y", errors="coerce")
+
+    mask_iso = res.isna() & s.notna() & ~s.isin(["nan", "NaT", "None", ""])
+    if mask_iso.any():
+        res.loc[mask_iso] = pd.to_datetime(s.loc[mask_iso], format="%Y-%m-%d", errors="coerce")
+
+    mask_fallback = res.isna() & s.notna() & ~s.isin(["nan", "NaT", "None", ""])
+    if mask_fallback.any():
+        res.loc[mask_fallback] = pd.to_datetime(s.loc[mask_fallback], dayfirst=True, errors="coerce")
+
+    return res
+
+
+# ---------------------------------------------------------
+# 1. Data Preparation & Merging (Excludes Influencers)
 # ---------------------------------------------------------
 def prepare_sales_and_products(
         sales_df: pd.DataFrame,
         prod_df: pd.DataFrame,
         is_special_price: bool = False,
-        date_format: str = '%d-%m-%Y'
 ):
-    """Merges a sales table (normal or special) with the product table,
-    tagging transactions with is_special_price, calculating net_revenue, margin,
-    and enforcing dd-mm-yyyy date parsing.
+    """Merges a sales table with the product catalog on SKU, excludes influencer gifts[cite: 1],
+    tags special pricing, computes net revenue & margin, and parses dates cleanly.
     """
     sales = sales_df.copy()
+
+    # Strictly filter out influencer gifts per business rules[cite: 1]
+    tag_col = next((c for c in ["Etiquetas", "etiquetas", "tags"] if c in sales.columns), None)
+    if tag_col:
+        sales = sales[~sales[tag_col].astype(str).str.contains("influencer", case=False, na=False)].copy()
+
     sales["is_special_price"] = is_special_price
 
     if "unidades" in sales.columns and "Unidades" not in sales.columns:
@@ -23,56 +49,62 @@ def prepare_sales_and_products(
 
     prod = prod_df.copy()
 
-    # Merge sales with product data on SKU
+    # Merge sales with product catalog on SKU
     full_df = pd.merge(sales, prod, on="SKU", how="left")
 
-    # Calculate net revenue per item and total net revenue using PVP (€) and Coste unitario (€)
-    if "PVP (€)" in full_df.columns and "Coste unitario (€)" in full_df.columns:
-        full_df["net_revenue_per_item"] = (
-                full_df["PVP (€)"] - full_df["Coste unitario (€)"]
-        )
-        full_df["net_revenue"] = (
-                full_df["net_revenue_per_item"] * full_df["Unidades"]
-        )
-        if "margin" not in full_df.columns:
-            full_df["margin"] = full_df["net_revenue"] * 0.3  # placeholder formula
-    else:
-        full_df["net_revenue"] = full_df["Unidades"] * 10.0  # fallback
+    # Calculate net revenue and margin using effective price after discount
+    price_col = next((c for c in ["PVP unitario (€)", "PVP (€)"] if c in full_df.columns), None)
+    discount_col = next((c for c in ["Descuento (€)", "descuento"] if c in full_df.columns), None)
+    cost_col = next((c for c in ["Coste unitario (€)", "Coste"] if c in full_df.columns), None)
 
-    # Handle date column mapping with dd-mm-yyyy format and safe fallback
-    date_col = next(
-        (c for c in ["Fecha", "date", "created_at"] if c in full_df.columns),
-        None,
-    )
+    if price_col:
+        unit_price = full_df[price_col].fillna(0)
+        discount = full_df[discount_col].fillna(0) if discount_col else 0.0
+        effective_price = np.maximum(0, unit_price - discount)
+        full_df["net_revenue"] = effective_price * full_df["Unidades"]
+
+        if cost_col:
+            unit_cost = full_df[cost_col].fillna(0)
+            full_df["margin"] = (effective_price - unit_cost) * full_df["Unidades"]
+        else:
+            full_df["margin"] = full_df["net_revenue"] * 0.3
+    else:
+        full_df["net_revenue"] = full_df["Unidades"] * 10.0
+        full_df["margin"] = full_df["net_revenue"] * 0.3
+
+    # Parse date column cleanly
+    date_col = next((c for c in ["Fecha", "date", "created_at"] if c in full_df.columns), None)
     if date_col:
-        parsed = pd.to_datetime(full_df[date_col], format=date_format, errors="coerce")
-        if parsed.isna().all() or parsed.isna().mean() > 0.5:
-            parsed = pd.to_datetime(full_df[date_col], errors="coerce", dayfirst=True)
-        full_df["Fecha"] = parsed
+        full_df["Fecha"] = _safe_parse_date_series(full_df[date_col])
 
     return full_df
 
 
 # ---------------------------------------------------------
-# 2. Date Processing & Week Boundaries (Bulletproof)
+# 2. Date Processing & Week Boundaries (Bulletproof & DataFrame-Safe)
 # ---------------------------------------------------------
 def get_week_boundaries(
-        target_date: str = "09-11-2025", find_latest_monday: bool = True, date_format: str = '%d-%m-%Y'
+        target_date: str = "09-11-2025",
+        find_latest_monday: bool = True,
 ):
-    """Calculates current, previous, and last-year week start/end dates safely without any mapping errors."""
+    """Calculates current, previous, and last-year week start/end dates safely."""
+    if isinstance(target_date, (pd.DataFrame, pd.Series)):
+        target_date = target_date.iloc[0, 0] if isinstance(target_date, pd.DataFrame) else target_date.iloc[0]
+
     if isinstance(target_date, (pd.Timestamp, np.datetime64)):
         ref_date = pd.Timestamp(target_date)
     else:
-        ref_date = pd.to_datetime(target_date, format=date_format, errors="coerce")
+        target_str = str(target_date).strip()
+        ref_date = pd.to_datetime(target_str, format="%d-%m-%Y", errors="coerce")
         if pd.isna(ref_date):
-            ref_date = pd.to_datetime(target_date, dayfirst=True, errors="coerce")
+            ref_date = pd.to_datetime(target_str, format="%Y-%m-%d", errors="coerce")
         if pd.isna(ref_date):
-            ref_date = pd.to_datetime(target_date, errors="coerce")
+            ref_date = pd.to_datetime(target_str, dayfirst=True, errors="coerce")
         if pd.isna(ref_date):
             raise ValueError(f"Unable to parse target_date '{target_date}'.")
 
     if find_latest_monday:
-        days_to_monday = ref_date.dayofweek  # Lunes es 0
+        days_to_monday = ref_date.dayofweek  # Monday is 0
         current_monday = ref_date - pd.Timedelta(days=days_to_monday)
     else:
         current_monday = ref_date
@@ -97,7 +129,7 @@ def get_week_boundaries(
 
 
 # ---------------------------------------------------------
-# 3. Period Comparison Engine
+# 3. Period Comparison Engine (Supports Optional Market Filter)
 # ---------------------------------------------------------
 def compute_week_comparison(
         normal_sales_df: pd.DataFrame,
@@ -105,17 +137,21 @@ def compute_week_comparison(
         prod_df: pd.DataFrame,
         target_date: str = "09-11-2025",
         find_latest_monday: bool = True,
-        date_format: str = '%d-%m-%Y',
+        market: str = None,
 ):
     """Computes units, net revenue, and margin for target week, previous week,
-    and last year for both with and without special sales.
+    and last year for both with and without special sales (optionally filtered by market).
     """
-    norm_full = prepare_sales_and_products(normal_sales_df, prod_df, is_special_price=False, date_format=date_format)
-    spec_full = prepare_sales_and_products(special_sales_df, prod_df, is_special_price=True, date_format=date_format)
+    norm_full = prepare_sales_and_products(normal_sales_df, prod_df, is_special_price=False)
+    spec_full = prepare_sales_and_products(special_sales_df, prod_df, is_special_price=True)
     combined_full = pd.concat([norm_full, spec_full], ignore_index=True)
 
+    if market and "Mercado" in combined_full.columns:
+        combined_full = combined_full[combined_full["Mercado"] == market]
+        norm_full = norm_full[norm_full["Mercado"] == market]
+
     def _calculate(full_sales):
-        weeks = get_week_boundaries(target_date, find_latest_monday, date_format=date_format)
+        weeks = get_week_boundaries(target_date, find_latest_monday)
 
         def filter_week(df, start, end):
             return df[(df["Fecha"] >= start) & (df["Fecha"] <= end)]
@@ -167,28 +203,27 @@ def compute_market_distributions(
         prod_df: pd.DataFrame,
         target_date: str = "09-11-2025",
         find_latest_monday: bool = True,
-        date_format: str = '%d-%m-%Y',
+        market: str = None,
 ):
     """Computes distribution by market, section, category, and special price share."""
-    norm_full = prepare_sales_and_products(normal_sales_df, prod_df, is_special_price=False, date_format=date_format)
-    spec_full = prepare_sales_and_products(special_sales_df, prod_df, is_special_price=True, date_format=date_format)
+    norm_full = prepare_sales_and_products(normal_sales_df, prod_df, is_special_price=False)
+    spec_full = prepare_sales_and_products(special_sales_df, prod_df, is_special_price=True)
     combined_full = pd.concat([norm_full, spec_full], ignore_index=True)
 
-    weeks = get_week_boundaries(target_date, find_latest_monday, date_format=date_format)
+    weeks = get_week_boundaries(target_date, find_latest_monday)
     cur_sales = combined_full[
         (combined_full["Fecha"] >= weeks["current_start"])
         & (combined_full["Fecha"] <= weeks["current_end"])
-        ]
+    ]
 
-    dist_market = cur_sales.groupby("Mercado")[
-        ["Unidades", "net_revenue"]].sum().reset_index() if "Mercado" in cur_sales.columns else pd.DataFrame()
-    dist_section = cur_sales.groupby("Sección")[
-        ["Unidades", "net_revenue"]].sum().reset_index() if "Sección" in cur_sales.columns else pd.DataFrame()
-    dist_category = cur_sales.groupby("Categoría")[
-        ["Unidades", "net_revenue"]].sum().reset_index() if "Categoría" in cur_sales.columns else pd.DataFrame()
+    if market and "Mercado" in cur_sales.columns:
+        cur_sales = cur_sales[cur_sales["Mercado"] == market]
 
-    special_units = cur_sales[cur_sales["is_special_price"] == True][
-        "Unidades"].sum() if "is_special_price" in cur_sales.columns else 0
+    dist_market = cur_sales.groupby("Mercado")[["Unidades", "net_revenue", "margin"]].sum().reset_index() if "Mercado" in cur_sales.columns else pd.DataFrame()
+    dist_section = cur_sales.groupby("Sección")[["Unidades", "net_revenue", "margin"]].sum().reset_index() if "Sección" in cur_sales.columns else pd.DataFrame()
+    dist_category = cur_sales.groupby("Categoría")[["Unidades", "net_revenue", "margin"]].sum().reset_index() if "Categoría" in cur_sales.columns else pd.DataFrame()
+
+    special_units = cur_sales[cur_sales["is_special_price"] == True]["Unidades"].sum() if "is_special_price" in cur_sales.columns else 0
     total_units = cur_sales["Unidades"].sum()
     special_share = (special_units / total_units) if total_units > 0 else 0
 
@@ -210,28 +245,29 @@ def compute_model_sell_through(
         stock_df: pd.DataFrame,
         target_date: str = "09-11-2025",
         find_latest_monday: bool = True,
-        date_format: str = '%d-%m-%Y',
+        market: str = None,
 ):
     """Computes top 10 best and worst models with inventory sell-through."""
-    norm_full = prepare_sales_and_products(normal_sales_df, prod_df, is_special_price=False, date_format=date_format)
-    spec_full = prepare_sales_and_products(special_sales_df, prod_df, is_special_price=True, date_format=date_format)
+    norm_full = prepare_sales_and_products(normal_sales_df, prod_df, is_special_price=False)
+    spec_full = prepare_sales_and_products(special_sales_df, prod_df, is_special_price=True)
     combined_full = pd.concat([norm_full, spec_full], ignore_index=True)
 
-    weeks = get_week_boundaries(target_date, find_latest_monday, date_format=date_format)
+    weeks = get_week_boundaries(target_date, find_latest_monday)
 
     def _calc_sell_through(full_sales):
         cur_sales = full_sales[
             (full_sales["Fecha"] >= weeks["current_start"])
             & (full_sales["Fecha"] <= weeks["current_end"])
-            ]
+        ]
+
+        if market and "Mercado" in cur_sales.columns:
+            cur_sales = cur_sales[cur_sales["Mercado"] == market]
 
         model_perf = (
             cur_sales.groupby("Producto")
             .agg(
                 total_units=("Unidades", "sum"),
-                special_units=("Unidades", lambda x: x[
-                    cur_sales.loc[
-                        x.index, "is_special_price"] == True].sum() if "is_special_price" in cur_sales.columns else 0),
+                special_units=("Unidades", lambda x: x[cur_sales.loc[x.index, "is_special_price"] == True].sum()),
                 total_revenue=("net_revenue", "sum"),
                 sold_stock=("Unidades", "sum"),
             )
@@ -246,20 +282,14 @@ def compute_model_sell_through(
 
         if stock_df is not None and not stock_df.empty:
             stock_with_prod = pd.merge(stock_df, prod_df[["SKU", "Producto"]], on="SKU", how="left")
-            stock_col = next(
-                (c for c in ["Stock disponible (uds)", "ending_stock", "stock"] if c in stock_with_prod.columns),
-                "Stock disponible (uds)")
+            stock_col = next((c for c in ["Stock disponible (uds)", "ending_stock", "stock"] if c in stock_with_prod.columns), "Stock disponible (uds)")
 
-            stock_agg = (
-                stock_with_prod.groupby("Producto")[stock_col].sum().reset_index()
-            )
+            stock_agg = stock_with_prod.groupby("Producto")[stock_col].sum().reset_index()
             stock_agg.rename(columns={stock_col: "Stock disponible (uds)"}, inplace=True)
 
             model_perf = pd.merge(model_perf, stock_agg, on="Producto", how="left")
             model_perf["Stock disponible (uds)"] = model_perf["Stock disponible (uds)"].fillna(0)
-            model_perf["initial_stock"] = (
-                    model_perf["Stock disponible (uds)"] + model_perf["sold_stock"]
-            )
+            model_perf["initial_stock"] = model_perf["Stock disponible (uds)"] + model_perf["sold_stock"]
         else:
             model_perf["initial_stock"] = model_perf["sold_stock"]
 
@@ -280,19 +310,18 @@ def compute_model_sell_through(
 
 
 # ---------------------------------------------------------
-# 6. Granular Weekly Hierarchies & Derivatives
+# 6. Granular Weekly Hierarchies & Derivatives (Includes Market)
 # ---------------------------------------------------------
 def compute_weekly_aggregations_with_derivatives(
         normal_sales_df: pd.DataFrame,
         special_sales_df: pd.DataFrame,
         prod_df: pd.DataFrame,
-        date_format: str = '%d-%m-%Y',
 ):
     """Builds granular weekly tables with 1st and 2nd derivatives of units sold,
-    including the percentage of units sold at special price (`pct_sold_at_sale`).
+    including Market-level and SKU-Market breakdowns.
     """
-    norm_full = prepare_sales_and_products(normal_sales_df, prod_df, is_special_price=False, date_format=date_format)
-    spec_full = prepare_sales_and_products(special_sales_df, prod_df, is_special_price=True, date_format=date_format)
+    norm_full = prepare_sales_and_products(normal_sales_df, prod_df, is_special_price=False)
+    spec_full = prepare_sales_and_products(special_sales_df, prod_df, is_special_price=True)
     combined_full = pd.concat([norm_full, spec_full], ignore_index=True)
 
     def _build_pipeline(full_sales):
@@ -300,18 +329,18 @@ def compute_weekly_aggregations_with_derivatives(
         df["week_start"] = df["Fecha"] - pd.to_timedelta(df["Fecha"].dt.dayofweek, unit="d")
 
         def build_agg(group_cols):
-            cols = ["week_start"] + group_cols
+            valid_cols = [c for c in group_cols if c in df.columns]
+            cols = ["week_start"] + valid_cols
             agg_df = (
                 df.groupby(cols)
                 .agg(
                     units=("Unidades", "sum"),
-                    special_units=("Unidades", lambda x: x[
-                        df.loc[x.index, "is_special_price"] == True].sum() if "is_special_price" in df.columns else 0),
+                    special_units=("Unidades", lambda x: x[df.loc[x.index, "is_special_price"] == True].sum()),
                     net_revenue=("net_revenue", "sum"),
                     margin=("margin", "sum"),
                 )
                 .reset_index()
-                .sort_values(by=["week_start"] + group_cols)
+                .sort_values(by=cols)
             )
 
             agg_df["pct_sold_at_sale"] = np.where(
@@ -321,9 +350,9 @@ def compute_weekly_aggregations_with_derivatives(
             )
             agg_df.drop(columns=["special_units"], inplace=True)
 
-            if group_cols:
-                agg_df["first_derivative"] = agg_df.groupby(group_cols)["units"].diff()
-                agg_df["second_derivative"] = agg_df.groupby(group_cols)["first_derivative"].diff()
+            if valid_cols:
+                agg_df["first_derivative"] = agg_df.groupby(valid_cols)["units"].diff()
+                agg_df["second_derivative"] = agg_df.groupby(valid_cols)["first_derivative"].diff()
             else:
                 agg_df["first_derivative"] = agg_df["units"].diff()
                 agg_df["second_derivative"] = agg_df["first_derivative"].diff()
@@ -332,10 +361,12 @@ def compute_weekly_aggregations_with_derivatives(
 
         return {
             "total": build_agg([]),
+            "Mercado": build_agg(["Mercado"]),
             "Categoría": build_agg(["Categoría"]),
             "Subcategoría": build_agg(["Subcategoría"]),
             "Producto": build_agg(["Producto"]),
             "SKU": build_agg(["SKU"]),
+            "SKU_Mercado": build_agg(["SKU", "Mercado"]),
             "Drop": build_agg(["Drop"]),
         }
 
@@ -346,13 +377,12 @@ def compute_weekly_aggregations_with_derivatives(
 
 
 # ---------------------------------------------------------
-# 7. Influencer Tracking (with dd-mm-yyyy date parsing)
+# 7. Influencer Tracking
 # ---------------------------------------------------------
 def compute_influencer_metrics(
         influencer_df: pd.DataFrame,
         target_date: str = "09-11-2025",
         find_latest_monday: bool = True,
-        date_format: str = '%d-%m-%Y',
 ):
     """Computes total influencer mentions per SKU for specific weeks and rolling windows."""
     if influencer_df is None or influencer_df.empty:
@@ -360,13 +390,9 @@ def compute_influencer_metrics(
 
     influencer_df = influencer_df.copy()
     date_col = next((c for c in ["Fecha", "date", "created_at"] if c in influencer_df.columns), "Fecha")
+    influencer_df[date_col] = _safe_parse_date_series(influencer_df[date_col])
 
-    parsed = pd.to_datetime(influencer_df[date_col], format=date_format, errors="coerce")
-    if parsed.isna().all() or parsed.isna().mean() > 0.5:
-        parsed = pd.to_datetime(influencer_df[date_col], errors="coerce", dayfirst=True)
-    influencer_df[date_col] = parsed
-
-    weeks = get_week_boundaries(target_date, find_latest_monday, date_format=date_format)
+    weeks = get_week_boundaries(target_date, find_latest_monday)
     ref_end = weeks["current_end"]
 
     influencer_df["week_start"] = influencer_df[date_col] - pd.to_timedelta(
@@ -398,28 +424,22 @@ def compute_influencer_metrics(
 
 
 # ---------------------------------------------------------
-# 8. Purchases Analytics Table (with dd-mm-yyyy date parsing)
+# 8. Purchases Analytics Table
 # ---------------------------------------------------------
-def compute_purchase_metrics(purchases_df: pd.DataFrame, date_format: str = '%d-%m-%Y'):
-    """Computes average lead time and delivery variance (actual vs estimated) with dd-mm-yyyy parsing."""
+def compute_purchase_metrics(purchases_df: pd.DataFrame):
+    """Computes average lead time and delivery variance (actual vs estimated)."""
     if purchases_df is None or purchases_df.empty:
         return None
 
     purchases = purchases_df.copy()
 
     date_col = next((c for c in ["Fecha", "created_at", "date", "order_date"] if c in purchases.columns), None)
-    est_col = next(
-        (c for c in ["Fecha llegada estimada", "estimated_delivery_date", "estimated_date"] if c in purchases.columns),
-        None)
-    act_col = next((c for c in ["Fecha llegada real", "Fecha llegada efectiva", "delivery_date", "actual_date"] if
-                    c in purchases.columns), None)
+    est_col = next((c for c in ["Fecha llegada estimada", "estimated_delivery_date", "estimated_date"] if c in purchases.columns), None)
+    act_col = next((c for c in ["Fecha llegada real", "Fecha llegada efectiva", "delivery_date", "actual_date"] if c in purchases.columns), None)
 
     for col in [date_col, act_col, est_col]:
         if col and col in purchases.columns:
-            parsed = pd.to_datetime(purchases[col], format=date_format, errors="coerce")
-            if parsed.isna().all() or parsed.isna().mean() > 0.5:
-                parsed = pd.to_datetime(purchases[col], errors="coerce", dayfirst=True)
-            purchases[col] = parsed
+            purchases[col] = _safe_parse_date_series(purchases[col])
 
     if date_col and act_col:
         purchases["actual_lead_time"] = (purchases[act_col] - purchases[date_col]).dt.days
@@ -443,228 +463,338 @@ def compute_purchase_metrics(purchases_df: pd.DataFrame, date_format: str = '%d-
 
 
 # ---------------------------------------------------------
-# 9. Week-by-Week 8-Week SKU-Level Inventory & Sales Prediction Engine (with Purchases)
+# 9. 4-Week Mutually Exclusive Inventory & Sales Prediction Engine
 # ---------------------------------------------------------
-def predict_inventory_status_8_weeks_weekly(
+def predict_inventory_status_4_weeks_sku(
         weekly_sku_df: pd.DataFrame,
         stock_df: pd.DataFrame,
-        purchases_df: pd.DataFrame = None,
         prod_df: pd.DataFrame = None,
         target_date: str = "09-11-2025",
         find_latest_monday: bool = True,
-        date_format: str = '%d-%m-%Y',
+        weeks_horizon: int = 4,
+        excess_stock_threshold: int = 60,
+        market: str = None,
 ):
-    """Predicts SKU-level inventory and sales status week-by-week over an 8-week horizon,
-    incorporating incoming purchase orders, a 6-week lead time, and calculating:
-    - recommended_reorder_date (defaults to target_date if running out with no incoming order or within lead time)
-    - recommended_order_units (units required to cover 8 weeks of demand from when the order arrives)
+    """Predicts SKU-level inventory status over 4 weeks with mutually exclusive buckets
+    (no overlap between running low and excess stock) and optional market filtering.
     """
     if weekly_sku_df is None or weekly_sku_df.empty or stock_df is None or stock_df.empty:
         return None
 
-    weeks = get_week_boundaries(target_date, find_latest_monday, date_format=date_format)
-    current_end = weeks["current_end"]
+    df_to_use = weekly_sku_df.copy()
+    if market and "Mercado" in df_to_use.columns:
+        df_to_use = df_to_use[df_to_use["Mercado"] == market]
 
-    # Parse target_date cleanly as the fallback/comparison reference date
-    ref_date = pd.to_datetime(target_date, format=date_format, errors="coerce")
-    if pd.isna(ref_date):
-        ref_date = pd.to_datetime(target_date, dayfirst=True, errors="coerce")
-    if pd.isna(ref_date):
-        ref_date = pd.to_datetime(target_date, errors="coerce")
-
-    # Define 8 forecast weeks (Weeks 1 to 8)
-    week_ranges = []
-    for k in range(1, 9):
-        w_start = current_end + pd.Timedelta(days=(k - 1) * 7 + 1)
-        w_end = current_end + pd.Timedelta(days=k * 7)
-        week_ranges.append((k, w_start, w_end))
-
-    # Process purchases for incoming stock (actual arrival date, fallback to estimated)
-    incoming_purchases_per_week = {k: pd.DataFrame(columns=["SKU", "incoming_stock"]) for k in range(1, 9)}
-    if purchases_df is not None and not purchases_df.empty:
-        p_df = purchases_df.copy()
-        sku_col = next((c for c in ["SKU", "product_id"] if c in p_df.columns), "SKU")
-        qty_col = next((c for c in ["Unidades", "unidades", "quantity", "qty"] if c in p_df.columns), "Unidades")
-
-        act_date_col = next(
-            (c for c in ["Fecha llegada real", "Fecha llegada efectiva", "delivery_date", "actual_date"] if
-             c in p_df.columns), None)
-        est_date_col = next(
-            (c for c in ["Fecha llegada estimada", "estimated_delivery_date", "estimated_date"] if c in p_df.columns),
-            None)
-
-        for col in [act_date_col, est_date_col]:
-            if col and col in p_df.columns:
-                parsed = pd.to_datetime(p_df[col], format=date_format, errors="coerce")
-                if parsed.isna().all() or parsed.isna().mean() > 0.5:
-                    parsed = pd.to_datetime(p_df[col], errors="coerce", dayfirst=True)
-                p_df[col] = parsed
-
-        if act_date_col and est_date_col:
-            p_df["effective_arrival_date"] = p_df[act_date_col].fillna(p_df[est_date_col])
-        elif act_date_col:
-            p_df["effective_arrival_date"] = p_df[act_date_col]
-        elif est_date_col:
-            p_df["effective_arrival_date"] = p_df[est_date_col]
-        else:
-            p_df["effective_arrival_date"] = pd.NaT
-
-        p_df = p_df.dropna(subset=["effective_arrival_date"])
-
-        for k, w_start, w_end in week_ranges:
-            mask = (p_df["effective_arrival_date"] >= w_start) & (p_df["effective_arrival_date"] <= w_end)
-            w_purchases = p_df[mask].groupby(sku_col)[qty_col].sum().reset_index()
-            w_purchases.rename(columns={sku_col: "SKU", qty_col: "incoming_stock"}, inplace=True)
-            incoming_purchases_per_week[k] = w_purchases
-
-    # Latest week record per SKU
+    # Get latest weekly record per SKU
     latest_weeks = (
-        weekly_sku_df.sort_values("week_start")
+        df_to_use.sort_values("week_start")
         .groupby("SKU")
         .last()
         .reset_index()
     )
 
-    stock_col = next(
-        (c for c in ["Stock disponible (uds)", "ending_stock", "stock"] if c in stock_df.columns),
-        "Stock disponible (uds)",
-    )
+    stock_col = next((c for c in ["Stock disponible (uds)", "ending_stock", "stock"] if c in stock_df.columns), "Stock disponible (uds)")
     stock_subset = stock_df[["SKU", stock_col]].copy()
     stock_subset.rename(columns={stock_col: "current_stock"}, inplace=True)
 
+    # Merge stock and sales derivative data on SKU
     pred_df = pd.merge(latest_weeks, stock_subset, on="SKU", how="right")
     pred_df["current_stock"] = pred_df["current_stock"].fillna(0)
     pred_df["units"] = pred_df["units"].fillna(0)
     pred_df["first_derivative"] = pred_df["first_derivative"].fillna(0)
     pred_df["second_derivative"] = pred_df["second_derivative"].fillna(0)
 
-    current_stock_tracker = pred_df["current_stock"].copy()
-    total_predicted_sales = np.zeros(len(pred_df))
-    total_incoming_8w = np.zeros(len(pred_df))
-    run_out_skus = set()
+    # Sales velocity (units/week)
+    pred_df["sales_velocity"] = np.maximum(0, pred_df["units"] + pred_df["first_derivative"])
+    pred_df["has_sales_history"] = pred_df["units"] > 0
 
-    for k, w_start, w_end in week_ranges:
-        weekly_sales = (
-            pred_df["units"]
-            + k * pred_df["first_derivative"]
-            + 0.5 * k * (k - 1) * pred_df["second_derivative"]
-        )
-        weekly_sales = np.maximum(0, weekly_sales)
+    # Project over the 4-week horizon
+    pred_df["projected_sales_4w"] = pred_df["sales_velocity"] * weeks_horizon
+    pred_df["projected_stock_4w"] = pred_df["current_stock"] - pred_df["projected_sales_4w"]
 
-        pred_df[f"sales_week_{k}"] = weekly_sales
-        total_predicted_sales += weekly_sales
+    # Mutually Exclusive Categorization Logic (Prevents overlap between Low Stock & Excess Stock)
+    # 1. Critical Stockouts: Projected stock <= 0 within 4 weeks
+    critical_stockouts = pred_df[pred_df["projected_stock_4w"] <= 0].copy()
+    critical_stockouts["inventory_status"] = "Critical Stockout (<=0)"
 
-        inc_df = incoming_purchases_per_week[k]
-        if not inc_df.empty:
-            inc_series = pred_df["SKU"].map(inc_df.set_index("SKU")["incoming_stock"]).fillna(0)
-        else:
-            inc_series = np.zeros(len(pred_df))
+    # Remaining items with positive stock after 4 weeks
+    positive_remaining = pred_df[pred_df["projected_stock_4w"] > 0].copy()
 
-        pred_df[f"incoming_week_{k}"] = inc_series
-        total_incoming_8w += inc_series
-
-        beginning_stock = current_stock_tracker + inc_series
-        ending_stock = beginning_stock - weekly_sales
-
-        run_out_mask = (beginning_stock < weekly_sales) | (ending_stock <= 0)
-        run_out_skus.update(pred_df[run_out_mask]["SKU"].tolist())
-
-        current_stock_tracker = np.maximum(0, ending_stock)
-        pred_df[f"ending_stock_week_{k}"] = current_stock_tracker
-
-    pred_df["predicted_8w_sales"] = total_predicted_sales
-    pred_df["total_incoming_8w"] = total_incoming_8w
-    pred_df["projected_ending_stock"] = current_stock_tracker
-
-    # Calculate Recommended Reorder Date & Units to Cover 8 Weeks from Arrival
-    lead_time_weeks = 6
-    coverage_weeks = 8
-    reorder_dates = []
-    order_quantities = []
-
-    for idx, row in pred_df.iterrows():
-        first_deficit_week = None
-        for k in range(1, 9):
-            if row[f"ending_stock_week_{k}"] <= 0:
-                first_deficit_week = k
-                break
-
-        has_incoming_order = row["total_incoming_8w"] > 0
-
-        if first_deficit_week is not None:
-            if not has_incoming_order or first_deficit_week <= lead_time_weeks:
-                calculated_date = ref_date
-                arrival_week = 1 + lead_time_weeks
-            else:
-                order_week_offset = first_deficit_week - lead_time_weeks
-                calculated_date = ref_date + pd.Timedelta(weeks=order_week_offset)
-                if calculated_date < ref_date:
-                    calculated_date = ref_date
-                    arrival_week = 1 + lead_time_weeks
-                else:
-                    arrival_week = first_deficit_week
-
-            units_needed_8w = 0.0
-            for j in range(arrival_week, arrival_week + coverage_weeks):
-                proj_week_demand = (
-                    row["units"]
-                    + j * row["first_derivative"]
-                    + 0.5 * j * (j - 1) * row["second_derivative"]
-                )
-                units_needed_8w += max(0.0, proj_week_demand)
-
-            stock_at_arrival = row[f"ending_stock_week_{arrival_week - 1}"] if arrival_week <= 9 else 0.0
-            net_order_qty = max(0.0, units_needed_8w - stock_at_arrival)
-        else:
-            calculated_date = ref_date + pd.Timedelta(weeks=8)
-            net_order_qty = 0.0
-
-        reorder_dates.append(calculated_date)
-        order_quantities.append(int(np.ceil(net_order_qty)))
-
-    pred_df["recommended_reorder_date"] = pd.to_datetime(reorder_dates)
-    pred_df["recommended_order_units"] = order_quantities
-
-    # Categorizations
-    sold_out_df = pred_df[pred_df["SKU"].isin(run_out_skus)].copy()
-    not_sold_df = pred_df[
-        (pred_df["predicted_8w_sales"] == 0)
-        & (pred_df["current_stock"] > 0)
-        & (~pred_df["SKU"].isin(run_out_skus))
+    # 2. Active Stock with Zero Sales Velocity (Dead Stock Risk)
+    dead_stock = positive_remaining[
+        (positive_remaining["current_stock"] > 0) & (positive_remaining["sales_velocity"] == 0)
     ].copy()
+    dead_stock["inventory_status"] = "Dead Stock (Active Inventory, Zero Velocity)"
 
-    less_than_5 = pred_df[
-        (pred_df["predicted_8w_sales"] > 0)
-        & (pred_df["predicted_8w_sales"] < 5)
-    ].copy()
-    less_than_10 = pred_df[
-        (pred_df["predicted_8w_sales"] >= 5)
-        & (pred_df["predicted_8w_sales"] < 10)
-    ].copy()
-    less_than_30 = pred_df[
-        (pred_df["predicted_8w_sales"] >= 10)
-        & (pred_df["predicted_8w_sales"] < 30)
-    ].copy()
+    # Active moving items (positive stock & positive sales velocity)
+    moving_items = positive_remaining[positive_remaining["sales_velocity"] > 0].copy()
 
+    # 3. Excess Stock: Moving items with high leftover buffer (>= excess_stock_threshold)
+    excess_stock = moving_items[moving_items["projected_stock_4w"] >= excess_stock_threshold].copy()
+    excess_stock["inventory_status"] = f"Excess Stock (>={excess_stock_threshold} units)"
+
+    # 4. Mutually Exclusive Low Stock Tiers (strictly below excess threshold)
+    non_excess_moving = moving_items[moving_items["projected_stock_4w"] < excess_stock_threshold].copy()
+
+    low_under_5 = non_excess_moving[non_excess_moving["projected_stock_4w"] < 5].copy()
+    low_under_5["inventory_status"] = "Low Stock (<5 units)"
+
+    low_5_to_9 = non_excess_moving[
+        (non_excess_moving["projected_stock_4w"] >= 5) & (non_excess_moving["projected_stock_4w"] < 10)
+    ].copy()
+    low_5_to_9["inventory_status"] = "Low Stock (5-9 units)"
+
+    low_10_to_29 = non_excess_moving[
+        (non_excess_moving["projected_stock_4w"] >= 10) & (non_excess_moving["projected_stock_4w"] < 30)
+    ].copy()
+    low_10_to_29["inventory_status"] = "Low Stock (10-29 units)"
+
+    healthy_stock = non_excess_moving[non_excess_moving["projected_stock_4w"] >= 30].copy()
+    healthy_stock["inventory_status"] = "Healthy Stock (30-59 units)"
+
+    # Combine labeled status back into full_predictions
+    categorized_all = pd.concat(
+        [critical_stockouts, dead_stock, excess_stock, low_under_5, low_5_to_9, low_10_to_29, healthy_stock],
+        ignore_index=True
+    )
+
+    # Separate datasets for items WITH vs WITHOUT sales history
+    catalog_with_sales = categorized_all[categorized_all["has_sales_history"]].copy()
+    catalog_without_sales = categorized_all[~categorized_all["has_sales_history"]].copy()
+
+    # Merge product metadata
     if prod_df is not None and not prod_df.empty:
-        meta_cols = [c for c in ["SKU", "Producto", "model", "Categoría", "Subcategoría", "Drop", "Sección", "Mercado"]
-                     if c in prod_df.columns]
+        meta_cols = [c for c in ["SKU", "Producto", "Color", "Talla", "Categoría", "Subcategoría", "Drop", "Sección"] if c in prod_df.columns]
         if meta_cols:
             meta_dedup = prod_df[meta_cols].drop_duplicates("SKU")
-            sold_out_df = pd.merge(sold_out_df, meta_dedup, on="SKU", how="left")
-            not_sold_df = pd.merge(not_sold_df, meta_dedup, on="SKU", how="left")
-            less_than_5 = pd.merge(less_than_5, meta_dedup, on="SKU", how="left")
-            less_than_10 = pd.merge(less_than_10, meta_dedup, on="SKU", how="left")
-            less_than_30 = pd.merge(less_than_30, meta_dedup, on="SKU", how="left")
-            pred_df = pd.merge(pred_df, meta_dedup, on="SKU", how="left")
+            critical_stockouts = pd.merge(critical_stockouts, meta_dedup, on="SKU", how="left")
+            dead_stock = pd.merge(dead_stock, meta_dedup, on="SKU", how="left")
+            excess_stock = pd.merge(excess_stock, meta_dedup, on="SKU", how="left")
+            low_under_5 = pd.merge(low_under_5, meta_dedup, on="SKU", how="left")
+            low_5_to_9 = pd.merge(low_5_to_9, meta_dedup, on="SKU", how="left")
+            low_10_to_29 = pd.merge(low_10_to_29, meta_dedup, on="SKU", how="left")
+            healthy_stock = pd.merge(healthy_stock, meta_dedup, on="SKU", how="left")
+            catalog_with_sales = pd.merge(catalog_with_sales, meta_dedup, on="SKU", how="left")
+            catalog_without_sales = pd.merge(catalog_without_sales, meta_dedup, on="SKU", how="left")
+            categorized_all = pd.merge(categorized_all, meta_dedup, on="SKU", how="left")
 
     return {
-        "sold_out": sold_out_df,
-        "not_sold_at_all": not_sold_df,
-        "sales_less_than_5": less_than_5,
-        "sales_less_than_10": less_than_10,
-        "sales_less_than_30": less_than_30,
-        "full_predictions": pred_df,
+        "critical_stockouts": critical_stockouts,
+        "dead_stock_zero_velocity": dead_stock,
+        "excess_stock": excess_stock,
+        "low_stock_under_5": low_under_5,
+        "low_stock_5_to_9": low_5_to_9,
+        "low_stock_10_to_29": low_10_to_29,
+        "healthy_stock": healthy_stock,
+        "catalog_items_with_sales": catalog_with_sales,
+        "catalog_items_without_sales": catalog_without_sales,
+        "full_predictions": categorized_all,
+    }
+
+
+# ---------------------------------------------------------
+# 10. 8-Week Purchase-Aware Inventory Forecast (feeds the dashboard)
+# ---------------------------------------------------------
+# NOTE: the dashboard hard-codes 8 weeks (ending_stock_week_1..8), so keep weeks_horizon=8.
+DEFAULT_LEAD_TIME_DAYS = 30   # used when the purchases sheet has no usable order->arrival history
+LOOKBACK_WEEKS = 4            # weekly demand = average units/week over the last N weeks
+
+
+def _latest_stock_per_sku(stock_df: pd.DataFrame) -> pd.DataFrame:
+    """One row per SKU with the most recent stock snapshot as `current_stock`."""
+    stock_col = next(
+        (c for c in ["Stock disponible (uds)", "ending_stock", "stock"] if c in stock_df.columns),
+        "Stock disponible (uds)",
+    )
+    s = stock_df.copy()
+    if "Fecha stock" in s.columns:
+        s["Fecha stock"] = _safe_parse_date_series(s["Fecha stock"])
+        s = s.sort_values("Fecha stock", kind="stable")
+    s = s.drop_duplicates("SKU", keep="last")
+    s["current_stock"] = pd.to_numeric(s[stock_col], errors="coerce").fillna(0).clip(lower=0)
+    return s[["SKU", "current_stock"]]
+
+
+def _purchase_arrival_dates(purchases: pd.DataFrame) -> pd.Series:
+    """Effective arrival date (real if known, otherwise estimated), normalized to midnight."""
+    arrival_col = next(
+        (c for c in ["Fecha llegada efectiva", "Fecha llegada real", "Fecha llegada estimada"]
+         if c in purchases.columns),
+        None,
+    )
+    if arrival_col is None:
+        return pd.Series(pd.NaT, index=purchases.index, dtype="datetime64[ns]")
+    return _safe_parse_date_series(purchases[arrival_col]).dt.normalize()
+
+
+def _incoming_units_by_week(purchases_df, forecast_start: pd.Timestamp, horizon: int) -> pd.DataFrame:
+    """Units arriving per SKU in each forecast week (week 1 = the 7 days after `forecast_start`).
+
+    Only orders whose arrival date falls inside the horizon are counted. Orders that already
+    arrived are assumed to be in the stock snapshot; open orders with a past estimated date
+    are ignored because we cannot tell whether they are late or cancelled.
+    """
+    cols = [f"incoming_week_{k}" for k in range(1, horizon + 1)]
+    empty = pd.DataFrame(columns=cols, dtype=float)
+    empty.index.name = "SKU"
+    if purchases_df is None or purchases_df.empty or "SKU" not in purchases_df.columns:
+        return empty
+
+    p = purchases_df.copy()
+    p["_arrival"] = _purchase_arrival_dates(p)
+    p["_units"] = pd.to_numeric(p["Unidades"], errors="coerce").fillna(0)
+    p = p[p["_arrival"].notna() & (p["_arrival"] > forecast_start)]
+    if p.empty:
+        return empty
+
+    p["_week"] = np.ceil((p["_arrival"] - forecast_start) / pd.Timedelta(days=7)).astype(int)
+    p = p[(p["_week"] >= 1) & (p["_week"] <= horizon)]
+    if p.empty:
+        return empty
+
+    table = p.pivot_table(index="SKU", columns="_week", values="_units", aggfunc="sum", fill_value=0)
+    table = table.reindex(columns=range(1, horizon + 1), fill_value=0)
+    table.columns = cols
+    return table.astype(float)
+
+
+def _lead_times_by_sku(purchases_df):
+    """Average order->arrival lead time (days) per SKU, plus a global median fallback."""
+    if purchases_df is None or purchases_df.empty or "SKU" not in purchases_df.columns:
+        return pd.Series(dtype=float), float(DEFAULT_LEAD_TIME_DAYS)
+
+    p = purchases_df.copy()
+    order_col = next((c for c in ["Fecha pedido", "Fecha de pedido", "Fecha compra", "Fecha"] if c in p.columns), None)
+    arrival_col = next(
+        (c for c in ["Fecha llegada real", "Fecha llegada efectiva", "Fecha llegada estimada"] if c in p.columns),
+        None,
+    )
+    if order_col is None or arrival_col is None:
+        return pd.Series(dtype=float), float(DEFAULT_LEAD_TIME_DAYS)
+
+    p["_lt"] = (_safe_parse_date_series(p[arrival_col]) - _safe_parse_date_series(p[order_col])).dt.days
+    p = p[p["_lt"] > 0]
+    if p.empty:
+        return pd.Series(dtype=float), float(DEFAULT_LEAD_TIME_DAYS)
+    return p.groupby("SKU")["_lt"].mean(), float(p["_lt"].median())
+
+
+def predict_inventory_8_weeks_sku(
+        weekly_sku_df: pd.DataFrame,
+        stock_df: pd.DataFrame,
+        purchases_df: pd.DataFrame = None,
+        prod_df: pd.DataFrame = None,
+        target_date: str = "09-11-2025",
+        find_latest_monday: bool = True,
+        weeks_horizon: int = 8,
+        lookback_weeks: int = LOOKBACK_WEEKS,
+        market: str = None,
+):
+    """SKU-level 8-week stock projection that adds incoming purchase orders to stock.
+
+    Method
+      * Forecast starts at the end of the target week (`current_end`).
+      * Weekly demand per SKU = average units/week over the last `lookback_weeks` weeks (flat).
+      * Ending stock week k = max(0, ending stock week k-1 + incoming_k - sales_k).
+      * A SKU is at risk when demand > 0 and its cumulative balance (stock + incoming - sales,
+        not floored at zero) reaches <= 0 inside the horizon. Recommended order units cover the
+        worst deficit; the reorder date is the projected stock-out date minus the SKU's average
+        lead time (global median, or DEFAULT_LEAD_TIME_DAYS if there is no history), never earlier
+        than the day after the forecast starts.
+
+    Pass purchases_df=None for the "without incoming orders" scenario.
+    """
+    if weekly_sku_df is None or weekly_sku_df.empty or stock_df is None or stock_df.empty:
+        return None
+
+    H = weeks_horizon
+    weeks = get_week_boundaries(target_date, find_latest_monday)
+    forecast_start = weeks["current_end"]
+
+    # ---- demand: average weekly units over the lookback window ----
+    sales = weekly_sku_df.copy()
+    if market and "Mercado" in sales.columns:
+        sales = sales[sales["Mercado"] == market]
+    sales["week_start"] = pd.to_datetime(sales["week_start"])
+    window_start = forecast_start - pd.Timedelta(days=7 * lookback_weeks)
+    recent = sales[(sales["week_start"] > window_start) & (sales["week_start"] <= forecast_start)]
+    velocity = recent.groupby("SKU")["units"].sum() / lookback_weeks
+
+    # ---- supply: stock snapshot + incoming purchase orders ----
+    stock = _latest_stock_per_sku(stock_df)
+    incoming = _incoming_units_by_week(purchases_df, forecast_start, H)
+
+    skus = pd.Index(stock["SKU"]).union(velocity.index).union(incoming.index)
+    pred = pd.DataFrame({"SKU": skus}).merge(stock, on="SKU", how="left")
+    pred["current_stock"] = pred["current_stock"].fillna(0.0)
+    pred["weekly_velocity"] = pred["SKU"].map(velocity).fillna(0.0)
+    pred["has_recent_sales"] = pred["weekly_velocity"] > 0
+
+    n = len(pred)
+    stock0 = pred["current_stock"].to_numpy(dtype=float)
+    vel = pred["weekly_velocity"].to_numpy(dtype=float)
+    inc_matrix = incoming.reindex(pred["SKU"]).fillna(0.0).to_numpy(dtype=float)
+    if inc_matrix.shape[1] != H:  # no purchases -> empty frame has the right columns, but be safe
+        inc_matrix = np.zeros((n, H))
+    sales_matrix = np.tile(vel.reshape(-1, 1), (1, H))
+
+    # ---- week-by-week stock (floored at zero) and cumulative balance (not floored) ----
+    ending = np.zeros((n, H))
+    running = stock0.copy()
+    for k in range(H):
+        running = np.maximum(0.0, running + inc_matrix[:, k] - sales_matrix[:, k])
+        ending[:, k] = running
+    balance = stock0.reshape(-1, 1) + np.cumsum(inc_matrix - sales_matrix, axis=1)
+
+    # ---- stock-out risk, order size and reorder date ----
+    at_risk = (vel > 0) & (balance <= 0).any(axis=1)
+    shortfall = np.maximum(0.0, -balance.min(axis=1))
+    order_units = np.where(at_risk, np.ceil(shortfall), 0).astype(int)
+
+    k0 = np.argmax(balance <= 0, axis=1)  # 0-based week in which the balance first hits <= 0
+    prev_balance = np.where(k0 == 0, stock0, balance[np.arange(n), np.maximum(k0 - 1, 0)])
+    frac = np.where(vel > 0, np.clip(prev_balance / np.where(vel > 0, vel, 1.0), 0.0, 1.0), 0.0)
+    days_to_stockout = k0 * 7 + frac * 7
+
+    lead_by_sku, lead_default = _lead_times_by_sku(purchases_df)
+    lead_days = pred["SKU"].map(lead_by_sku).fillna(lead_default).to_numpy(dtype=float)
+    offset_days = np.maximum(1.0, np.floor(days_to_stockout - lead_days))
+    reorder_dates = pd.Series(
+        (forecast_start + pd.to_timedelta(offset_days, unit="D")).to_numpy(), index=pred.index
+    ).where(order_units > 0)
+
+    # ---- assemble output ----
+    weekly_cols = pd.concat(
+        [
+            pd.DataFrame(sales_matrix, columns=[f"sales_week_{k}" for k in range(1, H + 1)], index=pred.index),
+            pd.DataFrame(inc_matrix, columns=[f"incoming_week_{k}" for k in range(1, H + 1)], index=pred.index),
+            pd.DataFrame(ending, columns=[f"ending_stock_week_{k}" for k in range(1, H + 1)], index=pred.index),
+        ],
+        axis=1,
+    ).round(1)
+    pred = pd.concat([pred, weekly_cols], axis=1)
+
+    pred["predicted_8w_sales"] = sales_matrix.sum(axis=1).round(1)
+    pred["total_incoming_8w"] = inc_matrix.sum(axis=1).round(1)
+    pred["projected_ending_stock"] = ending[:, -1].round(1)
+    pred["recommended_order_units"] = order_units
+    pred["recommended_reorder_date"] = reorder_dates
+    pred["weekly_velocity"] = pred["weekly_velocity"].round(2)
+
+    if prod_df is not None and not prod_df.empty:
+        meta_cols = [c for c in ["SKU", "Producto", "Color", "Talla", "Categoría", "Subcategoría", "Drop", "Sección"]
+                     if c in prod_df.columns]
+        if len(meta_cols) > 1:
+            pred = pred.merge(prod_df[meta_cols].drop_duplicates("SKU"), on="SKU", how="left")
+
+    stock_cols = [f"ending_stock_week_{k}" for k in range(1, H + 1)]
+    sold_out_mask = (pred[stock_cols] <= 0).any(axis=1) & (pred["predicted_8w_sales"] > 0)
+    not_sold_mask = (pred["current_stock"] > 0) & (pred["predicted_8w_sales"] == 0)
+
+    return {
+        "full_predictions": pred,
+        "sold_out": pred[sold_out_mask].copy(),
+        "not_sold_at_all": pred[not_sold_mask].copy(),
     }
 
 
@@ -675,26 +805,18 @@ def compute_inventory_predictions_for_both(
         prod_df: pd.DataFrame = None,
         target_date: str = "09-11-2025",
         find_latest_monday: bool = True,
-        date_format: str = '%d-%m-%Y',
+        weeks_horizon: int = 8,
+        market: str = None,
 ):
-    """Computes 8-week inventory predictions for both with_special_sales and without_special_sales, incorporating purchases."""
+    """8-week predictions for both with_special_sales and without_special_sales.
+
+    purchases_df=None gives the 'without incoming orders' scenario used by the dashboard toggle.
+    """
+    key = "SKU_Mercado" if market else "SKU"
     return {
-        "with_special_sales": predict_inventory_status_8_weeks_weekly(
-            weekly_sku_df=weekly_tables["with_special_sales"]["SKU"],
-            stock_df=stock_df,
-            purchases_df=purchases_df,
-            prod_df=prod_df,
-            target_date=target_date,
-            find_latest_monday=find_latest_monday,
-            date_format=date_format,
-        ),
-        "without_special_sales": predict_inventory_status_8_weeks_weekly(
-            weekly_sku_df=weekly_tables["without_special_sales"]["SKU"],
-            stock_df=stock_df,
-            purchases_df=purchases_df,
-            prod_df=prod_df,
-            target_date=target_date,
-            find_latest_monday=find_latest_monday,
-            date_format=date_format,
-        ),
+        scenario: predict_inventory_8_weeks_sku(
+            weekly_tables[scenario][key], stock_df, purchases_df, prod_df,
+            target_date, find_latest_monday, weeks_horizon, LOOKBACK_WEEKS, market,
+        )
+        for scenario in ("with_special_sales", "without_special_sales")
     }
