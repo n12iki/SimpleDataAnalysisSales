@@ -1,0 +1,11 @@
+services:
+  sales-analysis:
+    build: .
+    image: sales-analysis:latest
+    container_name: sales-analysis
+    init: true
+    restart: "no"
+    ports:
+      - "127.0.0.1:6080:6080"   # only reachable from this computer
+    volumes:
+      - ./data:/data            # put your Excel files here

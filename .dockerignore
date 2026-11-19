@@ -1,0 +1,11 @@
+data
+assets
+**/__pycache__
+*.pyc
+.git
+*.xlsx
+*.xls
+*.xlsb
+*.bat
+*.ps1
+*.zip
