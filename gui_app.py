@@ -975,7 +975,7 @@ class LauncherApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("SimpleDataAnalysisSales — Setup")
-        self.geometry("620x310")
+        self.geometry("700x310")
         self.resizable(False, False)
 
         self.file_path_var = tk.StringVar(value="")
